@@ -32,6 +32,14 @@ type MultipartField = import("impers").MultipartField;
 let impersModule: ImpersModule | null = null;
 
 /**
+ * Test-only hook: inject a fake impers module (must implement `request`).
+ * Pass `null` to clear and restore real impers on next use.
+ */
+export function setImpersModuleForTests(mod: ImpersModule | null): void {
+  impersModule = mod;
+}
+
+/**
  * Load impers and let it resolve libcurl with its native order:
  * 1. LIBCURL_IMPERSONATE_PATH
  * 2. LIBCURL_PATH
