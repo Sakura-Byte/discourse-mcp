@@ -124,6 +124,12 @@ const ProfileSchema = z
       .optional()
       .default("chrome120")
       .describe("Browser profile for TLS/HTTP2 impersonation via impers (e.g. chrome120)"),
+    /** Max HTTP requests in a rolling window (0 = disabled). Applies to all client HTTP. */
+    rate_limit_max: z.number().int().min(0).optional().default(0),
+    /** Rolling window length in ms for rate_limit_max. */
+    rate_limit_window_ms: z.number().int().positive().optional().default(60000),
+    /** Optional minimum gap between HTTP requests (ms). */
+    rate_limit_min_interval_ms: z.number().int().min(0).optional().default(0),
   })
   .strict();
 
@@ -197,6 +203,18 @@ function mergeConfig(profile: Partial<Profile>, flags: Record<string, unknown>):
     allowed_upload_paths: parseAllowedUploadPaths(flags.allowed_upload_paths ?? flags["allowed-upload-paths"], "from CLI") ?? parseAllowedUploadPaths(profile.allowed_upload_paths, "from profile"),
     impersonate:
       ((flags.impersonate as string | undefined) ?? profile.impersonate ?? "chrome120") as string,
+    rate_limit_max:
+      ((flags.rate_limit_max ?? flags["rate-limit-max"]) as number | undefined) ??
+      profile.rate_limit_max ??
+      0,
+    rate_limit_window_ms:
+      ((flags.rate_limit_window_ms ?? flags["rate-limit-window-ms"]) as number | undefined) ??
+      profile.rate_limit_window_ms ??
+      60000,
+    rate_limit_min_interval_ms:
+      ((flags.rate_limit_min_interval_ms ?? flags["rate-limit-min-interval-ms"]) as number | undefined) ??
+      profile.rate_limit_min_interval_ms ??
+      0,
   } satisfies Profile;
   const result = ProfileSchema.safeParse(merged);
   if (!result.success) throw new Error(`Invalid configuration: ${result.error.message}`);
@@ -288,12 +306,28 @@ async function main() {
   const authOverrides = Array.isArray(config.auth_pairs)
     ? (config.auth_pairs as unknown as AuthOverride[])
     : undefined;
+  const rateLimit =
+    config.rate_limit_max > 0
+      ? {
+          max: config.rate_limit_max,
+          windowMs: config.rate_limit_window_ms,
+          minIntervalMs: config.rate_limit_min_interval_ms || undefined,
+        }
+      : undefined;
+  if (rateLimit) {
+    logger.info(
+      `HTTP sliding-window rate limit: max ${rateLimit.max} / ${rateLimit.windowMs}ms` +
+        (rateLimit.minIntervalMs ? ` min_interval ${rateLimit.minIntervalMs}ms` : "")
+    );
+  }
+
   const siteState = new SiteState({
     logger,
     timeoutMs: config.timeout_ms,
     defaultAuth: auth,
     authOverrides,
     impersonate: config.impersonate,
+    rateLimit,
   });
 
   const server = new McpServer(

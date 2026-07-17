@@ -10,6 +10,7 @@ Use this when the target forum sits behind **Cloudflare** (or similar) and the s
 | Default fingerprint | — | `chrome120` (override with `--impersonate` / profile) |
 | CF 403 | fails immediately | **delayed retry** (same profile, backoff) |
 | Images | markdown `upload://` only | **`discourse_read_image`** returns MCP `image` content (base64) for vision models |
+| HTTP rate limit | write tools ~1/s only | Optional **sliding window** on all HTTP (`rate_limit_*` profile fields) |
 | libcurl-impersonate | — | impers resolve order; if missing, **`gh` download fallback** |
 
 Requires **Node.js >= 24**.
@@ -35,9 +36,35 @@ Create `~/.grok/discourse-profile.json` (example for a User API key):
   ],
   "read_only": false,
   "allow_writes": true,
-  "log_level": "info"
+  "log_level": "info",
+  "rate_limit_max": 15,
+  "rate_limit_window_ms": 60000,
+  "rate_limit_min_interval_ms": 200
 }
 ```
+
+### HTTP sliding-window rate limit
+
+Measured on uscardforum (Cloudflare / edge):
+
+| Observation | Value |
+|-------------|--------|
+| Burst until first **429** | **~20** sequential requests |
+| Recovery after full burst | **~40s** of continued 429 on probes, then OK |
+| Sustained 1 req / 0.8–1.2s | Still hits 429 after **~20** → **not pure RPS** |
+| Sustained 1 rps in earlier run | Can stay green for short runs, but window still caps at ~20 |
+
+So the dominant pattern is **~20 requests per rolling ~60s window**, not a fixed RPS ceiling. Client-side limit should be a **sliding window**.
+
+Profile / CLI:
+
+| Field | Meaning |
+|-------|---------|
+| `rate_limit_max` | Max requests in the window (`0` = off, default) |
+| `rate_limit_window_ms` | Window length (default `60000`) |
+| `rate_limit_min_interval_ms` | Optional min gap between requests |
+
+uscardforum-safe defaults used locally: **15 / 60s** + **200ms** min interval (margin under the ~20 hard edge).
 
 Generate a User API key (no admin required):
 

@@ -3,6 +3,7 @@ import {
   bootstrapLibcurlWithGh,
   formatBootstrapFailure,
 } from "./bootstrap_libcurl.js";
+import { SlidingWindowRateLimiter, type SlidingWindowOptions } from "./rate_limit.js";
 
 export type AuthMode =
   | { type: "none" }
@@ -17,6 +18,11 @@ export interface HttpClientOptions {
   httpBasicAuth?: { user: string; pass: string };
   /** Browser profile for impers / curl-impersonate (default chrome120; works with official libcurl-impersonate releases). */
   impersonate?: string;
+  /**
+   * Optional sliding-window limit for all outbound HTTP (reads + writes).
+   * max<=0 disables. Shared per HttpClient instance (typically one per site).
+   */
+  rateLimit?: SlidingWindowOptions;
 }
 
 export class HttpError extends Error {
@@ -136,6 +142,7 @@ export class HttpClient {
   private base: URL;
   private cache = new Map<string, { value: any; expiresAt: number }>();
   private impersonate: string;
+  private rateLimiter: SlidingWindowRateLimiter | null;
 
   constructor(private opts: HttpClientOptions) {
     this.base = new URL(opts.baseUrl);
@@ -143,6 +150,10 @@ export class HttpClient {
       this.base.pathname += "/";
     }
     this.impersonate = opts.impersonate || "chrome120";
+    this.rateLimiter =
+      opts.rateLimit && opts.rateLimit.max > 0 && opts.rateLimit.windowMs > 0
+        ? new SlidingWindowRateLimiter(opts.rateLimit)
+        : null;
   }
 
   private urlFor(path: string): string {
@@ -315,6 +326,13 @@ export class HttpClient {
   ) {
     const url = this.urlFor(path);
     this.opts.logger.debug(`HTTP ${method} ${url} (impersonate=${this.impersonate})`);
+
+    if (this.rateLimiter) {
+      const waited = await this.rateLimiter.acquire();
+      if (waited > 0) {
+        this.opts.logger.debug(`HTTP rate limit waited ${waited}ms before ${method} ${url}`);
+      }
+    }
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.opts.timeoutMs);

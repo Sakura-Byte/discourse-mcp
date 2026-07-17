@@ -1,5 +1,6 @@
 import type { Logger } from "../util/logger.js";
 import { HttpClient, type AuthMode } from "../http/client.js";
+import type { SlidingWindowOptions } from "../http/rate_limit.js";
 
 export type AuthOverride = {
   site: string; // base URL or origin to match
@@ -34,6 +35,8 @@ export class SiteState {
       authOverrides?: AuthOverride[];
       /** Browser impersonate profile for impers (e.g. chrome120). */
       impersonate?: string;
+      /** Sliding-window rate limit for all HTTP to this site. */
+      rateLimit?: SlidingWindowOptions;
     }
   ) {}
 
@@ -77,6 +80,7 @@ export class SiteState {
       auth,
       httpBasicAuth,
       impersonate: this.opts.impersonate,
+      rateLimit: this.opts.rateLimit,
     });
     this.clientCache.set(base, client);
     return { base, client };
