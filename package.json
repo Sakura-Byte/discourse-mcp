@@ -1,0 +1,69 @@
+{
+  "name": "discourse-mcp",
+  "mcpName": "io.github.sakura-byte/discourse-mcp",
+  "version": "0.2.9-cf.3",
+  "description": "Discourse MCP with impers (curl-impersonate) HTTP client for Cloudflare-protected sites. Fork of @discourse/mcp.",
+  "author": "Sakura-Byte (upstream: Discourse)",
+  "license": "MIT",
+  "keywords": [
+    "discourse",
+    "mcp",
+    "cloudflare",
+    "curl-impersonate",
+    "impers"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sakura-Byte/discourse-mcp.git"
+  },
+  "homepage": "https://github.com/Sakura-Byte/discourse-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/Sakura-Byte/discourse-mcp/issues"
+  },
+  "private": false,
+  "type": "module",
+  "bin": {
+    "discourse-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build",
+    "dev": "node --enable-source-maps dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src",
+    "clean": "rm -rf dist",
+    "sync:fixtures": "node scripts/sync-fixtures.mjs",
+    "test": "node --test dist/test/**/*.js"
+  },
+  "files": [
+    "dist/**",
+    "README.md",
+    "LICENSE",
+    "README-CF.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "impers": "^0.0.9",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.2",
+    "@types/node": "^20.14.10",
+    "eslint": "^9.39.2",
+    "typescript": "^5.5.4",
+    "typescript-eslint": "^8.53.1"
+  },
+  "packageManager": "pnpm@10.14.0",
+  "allowScripts": {
+    "koffi@3.1.1": true
+  }
+}

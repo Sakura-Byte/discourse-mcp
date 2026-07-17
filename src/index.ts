@@ -1,0 +1,440 @@
+#!/usr/bin/env node
+import { readFile } from "node:fs/promises";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { z } from "zod";
+import { generateUserApiKey, type GenerateOptions } from "./user-api-key-generator.js";
+
+// Read package version at runtime to avoid import-attributes incompatibility
+async function getPackageVersion(): Promise<string> {
+  try {
+    const pkgPath = new URL("../package.json", import.meta.url);
+    const raw = await readFile(pkgPath, "utf8");
+    const pkg = JSON.parse(raw) as { version?: string };
+    return pkg.version || "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+import { Logger, type LogLevel } from "./util/logger.js";
+import { redactObject } from "./util/redact.js";
+import { parseArgs } from "./util/cli.js";
+import { type AuthMode, checkImpersonateLibrary } from "./http/client.js";
+import { registerAllTools, type ToolsMode } from "./tools/registry.js";
+import { tryRegisterRemoteTools } from "./tools/remote/tool_exec_api.js";
+import { registerAllResources } from "./resources/registry.js";
+import { registerAllPrompts } from "./prompts/registry.js";
+import { SiteState, type AuthOverride } from "./site/state.js";
+
+const DEFAULT_TIMEOUT_MS = 15000;
+const LOOPBACK_HOST = "127.0.0.1";
+
+function allowedHttpHosts(port: number): string[] {
+  return [`localhost:${port}`, `127.0.0.1:${port}`, `[::1]:${port}`];
+}
+
+function allowedHttpOrigins(port: number): string[] {
+  return [`http://localhost:${port}`, `http://127.0.0.1:${port}`, `http://[::1]:${port}`];
+}
+
+function httpHostError(req: IncomingMessage, port: number): string | undefined {
+  const host = req.headers.host;
+  if (!host || !allowedHttpHosts(port).includes(host)) {
+    return `Invalid Host header: ${host}`;
+  }
+}
+
+function httpOriginError(req: IncomingMessage, port: number): string | undefined {
+  const origin = req.headers.origin;
+  if (!origin) {
+    return;
+  }
+
+  const originHeader = Array.isArray(origin) ? origin[0] : origin;
+  if (!allowedHttpOrigins(port).includes(originHeader)) {
+    return `Invalid Origin header: ${originHeader}`;
+  }
+}
+
+function rejectMcpRequest(res: ServerResponse, message: string): void {
+  res.writeHead(403, { "Content-Type": "application/json" });
+  res.end(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      error: {
+        code: -32000,
+        message,
+      },
+      id: null,
+    })
+  );
+}
+
+// CLI config schema - see also src/util/cli.ts for parseArgs
+const ProfileSchema = z
+  .object({
+    auth_pairs: z
+      .array(
+        z
+          .object({
+            site: z.string().url(),
+            api_key: z.string().optional(),
+            api_username: z.string().optional(),
+            user_api_key: z.string().optional(),
+            user_api_client_id: z.string().optional(),
+            http_basic_user: z.string().optional(),
+            http_basic_pass: z.string().optional(),
+          })
+          .strict()
+      )
+      .optional(),
+    read_only: z.boolean().optional().default(true),
+    allow_writes: z.boolean().optional().default(false),
+    timeout_ms: z.number().int().positive().optional().default(DEFAULT_TIMEOUT_MS),
+    concurrency: z.number().int().positive().optional().default(4),
+    cache_dir: z.string().optional(),
+    log_level: z.enum(["silent", "error", "info", "debug"]).optional().default("info"),
+    show_emails: z.boolean().optional().default(false),
+    tools_mode: z.enum(["auto", "discourse_api_only", "tool_exec_api"]).optional().default("auto"),
+    site: z.string().url().optional().describe("Tether MCP to a single Discourse site; hides select_site and preselects this site"),
+    default_search: z.string().optional().describe("Optional search prefix added to every search query (set via --default-search)"),
+    max_read_length: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .default(50000)
+      .describe("Maximum number of characters to include when returning post content (set via --max-read-length)"),
+    transport: z.enum(["stdio", "http"]).optional().default("stdio").describe("Transport type: stdio (default) or http"),
+    port: z.number().int().positive().optional().default(3000).describe("Port to listen on when using HTTP transport"),
+    allowed_upload_paths: z.union([z.array(z.string()), z.string()])
+      .optional()
+      .transform((val) => {
+        // Normalize to array (parseAllowedUploadPaths handles this, but schema re-validates after merge)
+        if (val === undefined) return undefined;
+        if (Array.isArray(val)) return val;
+        // Comma-separated string
+        return val.split(",").map(s => s.trim()).filter(Boolean);
+      })
+      .describe("Allowed directories for local file uploads (array or comma-separated string)"),
+    impersonate: z
+      .string()
+      .optional()
+      .default("chrome120")
+      .describe("Browser profile for TLS/HTTP2 impersonation via impers (e.g. chrome120)"),
+  })
+  .strict();
+
+type Profile = z.infer<typeof ProfileSchema>;
+
+async function loadProfile(path?: string): Promise<Partial<Profile>> {
+  if (!path) return {};
+  const txt = await readFile(path, "utf8");
+  const raw = JSON.parse(txt);
+  const parsed = ProfileSchema.partial().safeParse(raw);
+  if (!parsed.success) throw new Error(`Invalid profile JSON: ${parsed.error.message}`);
+  return parsed.data;
+}
+
+function parseAuthPairs(value: unknown, source: string): AuthOverride[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (Array.isArray(value)) return value as AuthOverride[];
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return undefined;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return parsed as AuthOverride[];
+      throw new Error(`auth_pairs ${source} must be a JSON array`);
+    } catch (e: any) {
+      if (e.message?.includes("auth_pairs")) throw e;
+      throw new Error(`Failed to parse auth_pairs ${source} as JSON: ${e.message}`);
+    }
+  }
+  throw new Error(`auth_pairs ${source} must be a JSON array or array value`);
+}
+
+function parseAllowedUploadPaths(value: unknown, source: string): string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (Array.isArray(value)) return value.map(String);
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    // Try parsing as JSON array first
+    if (trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) return parsed.map(String);
+        throw new Error(`allowed_upload_paths ${source} must be an array, got ${typeof parsed}`);
+      } catch (e: any) {
+        if (e.message?.includes("allowed_upload_paths")) throw e;
+        throw new Error(`Failed to parse allowed_upload_paths ${source} as JSON: ${e.message}`);
+      }
+    }
+    // Parse as comma-separated list
+    return value.split(",").map(s => s.trim()).filter(Boolean);
+  }
+  throw new Error(`allowed_upload_paths ${source} must be a string or array, got ${typeof value}`);
+}
+
+function mergeConfig(profile: Partial<Profile>, flags: Record<string, unknown>): Profile {
+  const merged = {
+    auth_pairs: parseAuthPairs(flags.auth_pairs ?? flags["auth-pairs"], "from CLI") ?? parseAuthPairs(profile.auth_pairs, "from profile"),
+    read_only: ((flags.read_only ?? flags["read-only"]) as boolean | undefined) ?? profile.read_only ?? true,
+    allow_writes: ((flags.allow_writes ?? flags["allow-writes"]) as boolean | undefined) ?? profile.allow_writes ?? false,
+    timeout_ms: ((flags.timeout_ms ?? flags["timeout-ms"]) as number | undefined) ?? profile.timeout_ms ?? DEFAULT_TIMEOUT_MS,
+    concurrency: (flags.concurrency as number | undefined) ?? profile.concurrency ?? 4,
+    cache_dir: ((flags.cache_dir ?? flags["cache-dir"]) as string | undefined) ?? profile.cache_dir,
+    log_level: (((flags.log_level ?? flags["log-level"]) as LogLevel | undefined) ?? (profile.log_level as LogLevel | undefined) ?? "info") as LogLevel,
+    show_emails: (((flags.show_emails ?? flags["show-emails"]) as boolean | undefined) ?? (profile.show_emails as boolean | undefined) ?? false) as boolean,
+    tools_mode: (((flags.tools_mode ?? flags["tools-mode"]) as ToolsMode | undefined) ?? (profile.tools_mode as ToolsMode | undefined) ?? "auto") as ToolsMode,
+    site: (flags.site as string | undefined) ?? profile.site,
+    default_search: (((flags.default_search ?? flags["default-search"]) as string | undefined) ?? profile.default_search) as string | undefined,
+    max_read_length: (((flags.max_read_length ?? flags["max-read-length"]) as number | undefined) ?? profile.max_read_length ?? 50000) as number,
+    transport: ((flags.transport as "stdio" | "http" | undefined) ?? profile.transport ?? "stdio") as "stdio" | "http",
+    port: ((flags.port as number | undefined) ?? profile.port ?? 3000) as number,
+    allowed_upload_paths: parseAllowedUploadPaths(flags.allowed_upload_paths ?? flags["allowed-upload-paths"], "from CLI") ?? parseAllowedUploadPaths(profile.allowed_upload_paths, "from profile"),
+    impersonate:
+      ((flags.impersonate as string | undefined) ?? profile.impersonate ?? "chrome120") as string,
+  } satisfies Profile;
+  const result = ProfileSchema.safeParse(merged);
+  if (!result.success) throw new Error(`Invalid configuration: ${result.error.message}`);
+  return result.data;
+}
+
+function buildAuth(_config: Profile): AuthMode {
+  // Global default is no auth; use per-site overrides via auth_pairs when provided
+  return { type: "none" };
+}
+
+async function main() {
+  // Check if user wants to generate a User API Key
+  const args = process.argv.slice(2);
+  if (args[0] === "generate-user-api-key") {
+    // Use rawStrings to preserve nonce/payload values (e.g., leading zeros in numeric strings)
+    const subArgs = parseArgs(args.slice(1), { rawStrings: true });
+
+    // Show help if requested
+    if (subArgs.help || subArgs.h) {
+      await generateUserApiKey({ site: "" }); // Will show help and exit
+      return;
+    }
+
+    // Map parsed args to GenerateOptions (kebab-case CLI to camelCase options)
+    // All values are already strings due to rawStrings option
+    const options: GenerateOptions = {
+      site: (subArgs.site as string) ?? "",
+      scopes: subArgs.scopes as string | undefined,
+      applicationName: subArgs["application-name"] as string | undefined,
+      clientId: subArgs["client-id"] as string | undefined,
+      nonce: subArgs.nonce as string | undefined,
+      payload: subArgs.payload as string | undefined,
+      saveTo: subArgs["save-to"] as string | undefined,
+    };
+
+    await generateUserApiKey(options);
+    return;
+  }
+
+  const argv = parseArgs(process.argv.slice(2));
+  const profilePath = (argv.profile as string | undefined) ?? undefined;
+  const profile = await loadProfile(profilePath).catch((e) => {
+    throw new Error(`Failed to load profile: ${e?.message || String(e)}`);
+  });
+  const config = mergeConfig(profile, argv);
+
+  const logger = new Logger(config.log_level);
+  const auth = buildAuth(config);
+
+  // Meta log (stderr) without leaking secrets
+  const version = await getPackageVersion();
+  logger.info(`Starting Discourse MCP-CF v${version} (impers HTTP)`);
+  logger.debug(`Config: ${JSON.stringify(redactObject({ ...config }))}`);
+
+  // Probe curl-impersonate: impers native resolve, then gh CLI fallback if needed
+  try {
+    const lib = await checkImpersonateLibrary(logger);
+    if (lib.isImpersonate) {
+      const via = lib.via === "gh" ? " via gh" : "";
+      logger.info(
+        `libcurl-impersonate loaded${via}: ${lib.path} (impersonate=${config.impersonate})`
+      );
+    } else {
+      logger.error(
+        `libcurl-impersonate NOT loaded (resolved ${lib.path}). ` +
+          `Cloudflare-protected sites will likely return 403.`
+      );
+      if (lib.bootstrapError) {
+        logger.error(lib.bootstrapError);
+      }
+      if (process.env.DISCOURSE_MCP_REQUIRE_IMPERSONATE !== "0") {
+        throw new Error(
+          "curl-impersonate library required but not loaded.\n" +
+            (lib.bootstrapError ||
+              "Set LIBCURL_IMPERSONATE_PATH, install gh + gh auth login, or DISCOURSE_MCP_REQUIRE_IMPERSONATE=0.")
+        );
+      }
+    }
+  } catch (e: any) {
+    if (String(e?.message || e).includes("curl-impersonate library required")) throw e;
+    logger.error(`Failed to probe impersonate library: ${e?.message || String(e)}`);
+    if (process.env.DISCOURSE_MCP_REQUIRE_IMPERSONATE !== "0") {
+      throw e;
+    }
+  }
+
+  // Initialize dynamic site state
+  const authOverrides = Array.isArray(config.auth_pairs)
+    ? (config.auth_pairs as unknown as AuthOverride[])
+    : undefined;
+  const siteState = new SiteState({
+    logger,
+    timeoutMs: config.timeout_ms,
+    defaultAuth: auth,
+    authOverrides,
+    impersonate: config.impersonate,
+  });
+
+  const server = new McpServer(
+    {
+      name: "discourse-mcp-cf",
+      version,
+    },
+    {
+      capabilities: {
+        tools: { listChanged: false },
+        resources: { listChanged: false },
+        prompts: { listChanged: false },
+      },
+    }
+  );
+
+  const allowWrites = Boolean(config.allow_writes && !config.read_only);
+  const showEmails = Boolean(config.show_emails);
+
+  // If tethered to a site, validate and preselect it before registering tools,
+  // and trigger remote tool discovery when enabled.
+  let hideSelectSite = false;
+  if (config.site) {
+    try {
+      const { base, client } = siteState.buildClientForSite(config.site);
+      const about = (await client.get(`/about.json`)) as any;
+      const title = about?.about?.title || about?.title || base;
+      siteState.selectSite(base);
+      hideSelectSite = true;
+      logger.info(`Tethered to site: ${base} (${title})`);
+    } catch (e: any) {
+      throw new Error(`Failed to validate --site ${config.site}: ${e?.message || String(e)}`);
+    }
+  }
+
+  await registerAllTools(server, siteState, logger, {
+    allowWrites,
+    toolsMode: config.tools_mode,
+    hideSelectSite,
+    defaultSearchPrefix: config.default_search,
+    maxReadLength: config.max_read_length,
+    allowedUploadPaths: config.allowed_upload_paths,
+    showEmails
+  });
+
+  // Register MCP resources (URI-addressable read-only data)
+  registerAllResources(server, { siteState, logger });
+
+  // Register MCP prompts (guided workflows)
+  registerAllPrompts(server, { siteState, logger });
+
+  // If tethered and remote tool discovery is enabled, discover now
+  if (config.site && config.tools_mode !== "discourse_api_only") {
+    await tryRegisterRemoteTools(server, siteState, logger);
+  }
+
+  // Create transport based on configuration
+  if (config.transport === "http") {
+    // HTTP transport using Streamable HTTP (stateless mode)
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined, // Stateless mode
+      enableJsonResponse: true,
+      enableDnsRebindingProtection: true,
+      allowedHosts: allowedHttpHosts(config.port),
+    });
+
+    await server.connect(transport);
+
+    const httpServer = createServer(async (req, res) => {
+      // Health check endpoint
+      if (req.method === "GET" && req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+
+      // MCP endpoint - handle via StreamableHTTPServerTransport
+      if (req.url === "/mcp" || req.url === "/") {
+        const headerError = httpHostError(req, config.port) ?? httpOriginError(req, config.port);
+        if (headerError) {
+          rejectMcpRequest(res, headerError);
+          return;
+        }
+
+        let body = "";
+        req.on("data", (chunk) => {
+          body += chunk;
+        });
+        req.on("end", async () => {
+          try {
+            const parsedBody = body ? JSON.parse(body) : undefined;
+            await transport.handleRequest(req, res, parsedBody);
+          } catch (error) {
+            logger.error(`Request handling error: ${error}`);
+            if (!res.headersSent) {
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Internal server error" }));
+            }
+          }
+        });
+        return;
+      }
+
+      // Unknown endpoint
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not found" }));
+    });
+
+    httpServer.listen(config.port, LOOPBACK_HOST, () => {
+      logger.info(`HTTP transport listening on ${LOOPBACK_HOST}:${config.port}`);
+      logger.info(`Health check available at http://localhost:${config.port}/health`);
+      logger.info(`MCP endpoint available at http://localhost:${config.port}/mcp`);
+    });
+
+    // Exit cleanly on SIGTERM/SIGINT
+    const onExit = () => {
+      httpServer.close(() => {
+        transport.close().then(() => {
+          logger.info("HTTP server closed");
+          process.exit(0);
+        });
+      });
+    };
+    process.on("SIGTERM", onExit);
+    process.on("SIGINT", onExit);
+  } else {
+    // Default stdio transport
+    const transport = new StdioServerTransport();
+
+    // Exit cleanly on stdin close or SIGTERM
+    const onExit = () => process.exit(0);
+    process.on("SIGTERM", onExit);
+    process.on("SIGINT", onExit);
+    process.stdin.on("close", onExit);
+
+    await server.connect(transport);
+  }
+}
+
+main().catch((err) => {
+  const msg = err?.message || String(err);
+  process.stderr.write(`[${new Date().toISOString()}] ERROR ${msg}\n`);
+  process.exit(1);
+});
