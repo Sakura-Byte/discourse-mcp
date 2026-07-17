@@ -20,7 +20,7 @@ export interface HttpClientOptions {
   impersonate?: string;
   /**
    * Optional sliding-window limit for all outbound HTTP (reads + writes).
-   * max<=0 disables. Shared per HttpClient instance (typically one per site).
+   * max<=0 disables. When rateLimit.statePath is set, shared across processes.
    */
   rateLimit?: SlidingWindowOptions;
 }
@@ -152,7 +152,7 @@ export class HttpClient {
     this.impersonate = opts.impersonate || "chrome120";
     this.rateLimiter =
       opts.rateLimit && opts.rateLimit.max > 0 && opts.rateLimit.windowMs > 0
-        ? new SlidingWindowRateLimiter(opts.rateLimit)
+        ? new SlidingWindowRateLimiter(opts.rateLimit, (msg) => this.opts.logger.error(msg))
         : null;
   }
 

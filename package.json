@@ -1,7 +1,7 @@
 {
   "name": "discourse-mcp",
   "mcpName": "io.github.sakura-byte/discourse-mcp",
-  "version": "0.2.9-cf.5",
+  "version": "0.2.9-cf.6",
   "description": "Discourse MCP with impers (curl-impersonate) HTTP client for Cloudflare-protected sites. Fork of @discourse/mcp.",
   "author": "Sakura-Byte (upstream: Discourse)",
   "license": "MIT",

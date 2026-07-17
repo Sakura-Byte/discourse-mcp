@@ -22,6 +22,7 @@ import { Logger, type LogLevel } from "./util/logger.js";
 import { redactObject } from "./util/redact.js";
 import { parseArgs } from "./util/cli.js";
 import { type AuthMode, checkImpersonateLibrary } from "./http/client.js";
+import { defaultRateLimitStateDir } from "./http/rate_limit.js";
 import { registerAllTools, type ToolsMode } from "./tools/registry.js";
 import { tryRegisterRemoteTools } from "./tools/remote/tool_exec_api.js";
 import { registerAllResources } from "./resources/registry.js";
@@ -130,6 +131,11 @@ const ProfileSchema = z
     rate_limit_window_ms: z.number().int().positive().optional().default(60000),
     /** Optional minimum gap between HTTP requests (ms). */
     rate_limit_min_interval_ms: z.number().int().min(0).optional().default(0),
+    /**
+     * Directory for cross-process rate-limit state (default ~/.cache/discourse-mcp/rate-limit).
+     * Shared by all MCP clients on this machine — not under ~/.grok.
+     */
+    rate_limit_state_dir: z.string().optional(),
   })
   .strict();
 
@@ -215,6 +221,9 @@ function mergeConfig(profile: Partial<Profile>, flags: Record<string, unknown>):
       ((flags.rate_limit_min_interval_ms ?? flags["rate-limit-min-interval-ms"]) as number | undefined) ??
       profile.rate_limit_min_interval_ms ??
       0,
+    rate_limit_state_dir:
+      ((flags.rate_limit_state_dir ?? flags["rate-limit-state-dir"]) as string | undefined) ??
+      profile.rate_limit_state_dir,
   } satisfies Profile;
   const result = ProfileSchema.safeParse(merged);
   if (!result.success) throw new Error(`Invalid configuration: ${result.error.message}`);
@@ -306,6 +315,8 @@ async function main() {
   const authOverrides = Array.isArray(config.auth_pairs)
     ? (config.auth_pairs as unknown as AuthOverride[])
     : undefined;
+  const rateLimitStateDir =
+    process.env.DISCOURSE_MCP_RATE_LIMIT_DIR || config.rate_limit_state_dir || undefined;
   const rateLimit =
     config.rate_limit_max > 0
       ? {
@@ -315,9 +326,11 @@ async function main() {
         }
       : undefined;
   if (rateLimit) {
+    const dir = rateLimitStateDir || defaultRateLimitStateDir();
     logger.info(
-      `HTTP sliding-window rate limit: max ${rateLimit.max} / ${rateLimit.windowMs}ms` +
-        (rateLimit.minIntervalMs ? ` min_interval ${rateLimit.minIntervalMs}ms` : "")
+      `HTTP sliding-window rate limit (cross-process file): max ${rateLimit.max} / ${rateLimit.windowMs}ms` +
+        (rateLimit.minIntervalMs ? ` min_interval ${rateLimit.minIntervalMs}ms` : "") +
+        ` state_dir=${dir}`
     );
   }
 
@@ -328,6 +341,7 @@ async function main() {
     authOverrides,
     impersonate: config.impersonate,
     rateLimit,
+    rateLimitStateDir,
   });
 
   const server = new McpServer(

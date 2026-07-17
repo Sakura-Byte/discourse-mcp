@@ -66,6 +66,16 @@ Profile / CLI:
 
 uscardforum-safe defaults used locally: **15 / 60s** + **200ms** min interval (margin under the ~20 hard edge).
 
+**Cross-process / all clients:** when rate limiting is enabled, timestamps are stored under a **shared cache directory** (not `~/.grok`):
+
+| Platform | Default state dir |
+|----------|-------------------|
+| macOS / Linux | `~/.cache/discourse-mcp/rate-limit` (or `$XDG_CACHE_HOME/discourse-mcp/rate-limit`) |
+| Windows | `%LOCALAPPDATA%/discourse-mcp/rate-limit` |
+
+Override with profile `rate_limit_state_dir` or env `DISCOURSE_MCP_RATE_LIMIT_DIR`.  
+One file per site origin (`sha1(origin).json`) + `.lock`. Multiple Grok/Claude/Cursor MCP processes share the same window. If the file lock fails, the process falls back to in-memory limiting and logs an error.
+
 Generate a User API key (no admin required):
 
 ```bash

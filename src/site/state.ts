@@ -1,6 +1,10 @@
 import type { Logger } from "../util/logger.js";
 import { HttpClient, type AuthMode } from "../http/client.js";
-import type { SlidingWindowOptions } from "../http/rate_limit.js";
+import {
+  originFromBaseUrl,
+  rateLimitStatePathForOrigin,
+  type SlidingWindowOptions,
+} from "../http/rate_limit.js";
 
 export type AuthOverride = {
   site: string; // base URL or origin to match
@@ -37,6 +41,8 @@ export class SiteState {
       impersonate?: string;
       /** Sliding-window rate limit for all HTTP to this site. */
       rateLimit?: SlidingWindowOptions;
+      /** Directory for cross-process rate-limit state files (client-agnostic cache). */
+      rateLimitStateDir?: string;
     }
   ) {}
 
@@ -73,6 +79,15 @@ export class SiteState {
     const httpBasicAuth = match?.http_basic_user && match?.http_basic_pass
       ? { user: match.http_basic_user, pass: match.http_basic_pass }
       : undefined;
+    const rateLimit = this.opts.rateLimit
+      ? {
+          ...this.opts.rateLimit,
+          statePath: rateLimitStatePathForOrigin(
+            originFromBaseUrl(base),
+            this.opts.rateLimitStateDir
+          ),
+        }
+      : undefined;
     const client = new HttpClient({
       baseUrl: base,
       timeoutMs: this.opts.timeoutMs,
@@ -80,7 +95,7 @@ export class SiteState {
       auth,
       httpBasicAuth,
       impersonate: this.opts.impersonate,
-      rateLimit: this.opts.rateLimit,
+      rateLimit,
     });
     this.clientCache.set(base, client);
     return { base, client };
