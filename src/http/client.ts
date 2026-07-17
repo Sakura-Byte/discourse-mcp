@@ -171,6 +171,28 @@ export class HttpClient {
     return this.request("GET", path, undefined, { signal, extraHeaders: headers });
   }
 
+  /**
+   * Fetch binary content (images, files). Returns Buffer + mime + final URL after redirects.
+   */
+  async getBinary(
+    path: string,
+    { signal, headers, maxBytes }: { signal?: AbortSignal; headers?: Record<string, string>; maxBytes?: number } = {}
+  ): Promise<{ buffer: Buffer; mimeType: string; url: string; bytes: number }> {
+    const h = this.headers();
+    // Do not force JSON Accept for binary assets (CDN images, short-url redirects)
+    h["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8";
+    if (headers) Object.assign(h, headers);
+
+    const result = await this.executeRequestBinary("GET", path, h, signal);
+    if (maxBytes && result.buffer.length > maxBytes) {
+      throw new Error(
+        `Binary response too large (${result.buffer.length} bytes > max ${maxBytes}). ` +
+          `Try a smaller/optimized URL or raise the limit.`
+      );
+    }
+    return result;
+  }
+
   async getCached(path: string, ttlMs: number, { signal }: { signal?: AbortSignal } = {}) {
     const url = this.urlFor(path);
     const entry = this.cache.get(url);
@@ -242,6 +264,47 @@ export class HttpClient {
     signal?: AbortSignal,
     allowRetries = true
   ) {
+    const res = await this.perform(method, path, body, headers, signal, allowRetries);
+    const ct = res.headers.get("content-type") || res.contentType || "";
+    if (ct.includes("application/json")) {
+      try {
+        return res.json();
+      } catch {
+        return safeJson(res.text);
+      }
+    }
+    return res.text;
+  }
+
+  private async executeRequestBinary(
+    method: string,
+    path: string,
+    headers: Record<string, string>,
+    signal?: AbortSignal,
+    allowRetries = true
+  ): Promise<{ buffer: Buffer; mimeType: string; url: string; bytes: number }> {
+    const res = await this.perform(method, path, undefined, headers, signal, allowRetries);
+    const buffer: Buffer = Buffer.isBuffer(res.content) ? res.content : Buffer.from(res.content ?? []);
+    const mimeType =
+      (res.headers.get("content-type") || res.contentType || "application/octet-stream").split(";")[0].trim() ||
+      "application/octet-stream";
+    return {
+      buffer,
+      mimeType,
+      url: res.url || this.urlFor(path),
+      bytes: buffer.length,
+    };
+  }
+
+  /** Shared impers request with retries; returns the raw Response-like object. */
+  private async perform(
+    method: string,
+    path: string,
+    body: string | FormData | undefined,
+    headers: Record<string, string>,
+    signal?: AbortSignal,
+    allowRetries = true
+  ) {
     const url = this.urlFor(path);
     this.opts.logger.debug(`HTTP ${method} ${url} (impersonate=${this.impersonate})`);
 
@@ -278,15 +341,7 @@ export class HttpClient {
           throw new HttpError(res.status, `HTTP ${res.status} ${res.statusText}`, errorBody);
         }
 
-        const ct = res.headers.get("content-type") || res.contentType || "";
-        if (ct.includes("application/json")) {
-          try {
-            return res.json();
-          } catch {
-            return safeJson(res.text);
-          }
-        }
-        return res.text;
+        return res;
       } catch (e: any) {
         if (e instanceof HttpError) {
           throw e;

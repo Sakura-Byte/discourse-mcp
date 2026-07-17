@@ -9,6 +9,7 @@ Use this when the target forum sits behind **Cloudflare** (or similar) and the s
 | HTTP | `fetch` | `impers` + browser impersonate |
 | Default fingerprint | — | `chrome120` (override with `--impersonate` / profile) |
 | CF 403 | fails immediately | **delayed retry** (same profile, backoff) |
+| Images | markdown `upload://` only | **`discourse_read_image`** returns MCP `image` content (base64) for vision models |
 | libcurl-impersonate | — | impers resolve order; if missing, **`gh` download fallback** |
 
 Requires **Node.js >= 24**.
@@ -148,7 +149,36 @@ Override: `DISCOURSE_MCP_REQUIRE_IMPERSONATE=0` allows starting without imperson
 | `--impersonate chrome120` | Browser fingerprint (also in profile) |
 | `--log_level debug` | Verbose HTTP |
 
-See upstream docs for full tool list (search, read topic/post, create post/topic, drafts, …).
+### Reading images (for vision models)
+
+MCP tools should return images as **Image Content** blocks (not only a base64 string inside JSON text):
+
+```json
+{
+  "content": [
+    { "type": "text", "text": "{...metadata...}" },
+    { "type": "image", "data": "<base64>", "mimeType": "image/jpeg" }
+  ]
+}
+```
+
+Use **`discourse_read_image`**:
+
+```json
+{ "post_id": 8564338, "max_images": 2 }
+```
+
+```json
+{ "url": "upload://q9cFN6AzFPTkcn4CVcNmkuXNDTi.jpeg" }
+```
+
+```json
+{ "url": "https://asset-cdn.example.com/.../photo.jpeg" }
+```
+
+Typical flow: `discourse_read_post` → see `![alt](upload://...)` in `raw` → `discourse_read_image` with `post_id` or that `upload://` URL.
+
+See upstream docs for the rest of the tool list (search, read topic/post, create post/topic, drafts, …).
 
 ---
 

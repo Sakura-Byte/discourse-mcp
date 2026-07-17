@@ -227,6 +227,7 @@ const READ_ONLY_TOOLS = [
   'discourse_filter_topics',
   'discourse_read_topic',
   'discourse_read_post',
+  'discourse_read_image',
   'discourse_get_user',
   'discourse_list_user_posts',
   'discourse_get_chat_messages',

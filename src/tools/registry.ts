@@ -4,6 +4,7 @@ import type { ToolRegistrar } from "./types.js";
 import { registerSearch } from "./builtin/search.js";
 import { registerReadTopic } from "./builtin/read_topic.js";
 import { registerReadPost } from "./builtin/read_post.js";
+import { registerReadImage } from "./builtin/read_image.js";
 import { registerGetUser } from "./builtin/get_user.js";
 import { registerCreatePost } from "./builtin/create_post.js";
 import { registerCreateCategory } from "./builtin/create_category.js";
@@ -73,6 +74,7 @@ export async function registerAllTools(
   // Read tools (parameterized lookups)
   registerReadTopic(server, ctx, { allowWrites: false });
   registerReadPost(server, ctx, { allowWrites: false });
+  registerReadImage(server, ctx, { allowWrites: false });
   registerGetUser(server, ctx, { allowWrites: false, showEmails: opts.showEmails });
   registerListUserPosts(server, ctx, { allowWrites: false });
   registerListUsers(server, ctx, { allowWrites: false, showEmails: opts.showEmails });
