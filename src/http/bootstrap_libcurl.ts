@@ -84,6 +84,41 @@ function run(
   };
 }
 
+/**
+ * tar invocations to try, in order. On Windows the `tar` on PATH is often Git's
+ * GNU tar, which parses `C:\...` as `host:path` ("Cannot connect to C: resolve failed"),
+ * so prefer the bsdtar shipped in System32 (also extracts .zip) and fall back to
+ * GNU tar with --force-local.
+ */
+export function tarCandidates(
+  platform: NodeJS.Platform = process.platform,
+  systemRoot: string | null = process.env.SystemRoot || process.env.windir || null
+): Array<{ cmd: string; extraArgs: string[] }> {
+  if (platform !== "win32") return [{ cmd: "tar", extraArgs: [] }];
+  const out: Array<{ cmd: string; extraArgs: string[] }> = [];
+  if (systemRoot) out.push({ cmd: join(systemRoot, "System32", "tar.exe"), extraArgs: [] });
+  out.push({ cmd: "tar", extraArgs: ["--force-local"] });
+  return out;
+}
+
+function extractArchive(archivePath: string, destDir: string): { ok: true } | { ok: false; error: string } {
+  const isZip = archivePath.endsWith(".zip");
+  if (isZip && process.platform !== "win32") {
+    const r = run("unzip", ["-o", archivePath, "-d", destDir]);
+    return r.status === 0 ? { ok: true } : { ok: false, error: r.stderr || r.stdout };
+  }
+  const errors: string[] = [];
+  for (const { cmd, extraArgs } of tarCandidates()) {
+    const args = isZip
+      ? ["-xf", archivePath, "-C", destDir]
+      : [...extraArgs, "-xzf", archivePath, "-C", destDir];
+    const r = run(cmd, args);
+    if (r.status === 0) return { ok: true };
+    errors.push(`${cmd}: ${(r.stderr || r.stdout || `exit ${r.status}`).trim()}`);
+  }
+  return { ok: false, error: errors.join("\n") };
+}
+
 export function hasGhCli(): boolean {
   const r = run("gh", ["--version"]);
   return r.status === 0;
@@ -140,6 +175,21 @@ function flattenLibrariesIntoCache(cacheDir: string): void {
 
 function manualInstallHint(cacheDir: string, pattern: string): string {
   const releaseUrl = `https://github.com/${REPO}/releases/latest`;
+  const ghSteps =
+    process.platform === "win32"
+      ? [
+          "  winget install GitHub.cli",
+          "  gh auth login",
+          `  gh release download -R ${REPO} -p '${pattern}' -D "${cacheDir}" --clobber`,
+          `  # PowerShell; use Windows tar (Git's GNU tar can't handle C:\\ paths)`,
+          `  Get-ChildItem "${cacheDir}\\*.tar.gz" | % { & "$env:SystemRoot\\System32\\tar.exe" -xzf $_.FullName -C "${cacheDir}" }`,
+        ]
+      : [
+          "  brew install gh   # or https://cli.github.com/",
+          "  gh auth login",
+          `  gh release download -R ${REPO} -p '${pattern}' -D /tmp/curl-imp-dl --clobber`,
+          `  mkdir -p '${cacheDir}' && tar -xzf /tmp/curl-imp-dl/libcurl-impersonate-*.tar.gz -C '${cacheDir}'`,
+        ];
   return [
     "",
     "Manual install:",
@@ -150,10 +200,7 @@ function manualInstallHint(cacheDir: string, pattern: string): string {
     `  4. Or set LIBCURL_IMPERSONATE_PATH to the full path of the library file`,
     "",
     "With GitHub CLI (recommended):",
-    "  brew install gh   # or https://cli.github.com/",
-    "  gh auth login",
-    `  gh release download -R ${REPO} -p '${pattern}' -D /tmp/curl-imp-dl --clobber`,
-    `  mkdir -p '${cacheDir}' && tar -xzf /tmp/curl-imp-dl/libcurl-impersonate-*.tar.gz -C '${cacheDir}'`,
+    ...ghSteps,
     "",
   ].join("\n");
 }
@@ -262,26 +309,14 @@ export function bootstrapLibcurlWithGh(logger: Logger): BootstrapResult {
   const asset = archives[0];
   const archivePath = join(tmp, asset);
 
-  if (asset.endsWith(".zip")) {
-    const unzip = run("unzip", ["-o", archivePath, "-d", cacheDir]);
-    if (unzip.status !== 0) {
-      rmSync(tmp, { recursive: true, force: true });
-      return {
-        ok: false,
-        reason: "extract_failed",
-        hint: `Failed to unzip ${asset}: ${unzip.stderr}` + manualInstallHint(cacheDir, pattern),
-      };
-    }
-  } else {
-    const tar = run("tar", ["-xzf", archivePath, "-C", cacheDir]);
-    if (tar.status !== 0) {
-      rmSync(tmp, { recursive: true, force: true });
-      return {
-        ok: false,
-        reason: "extract_failed",
-        hint: `Failed to extract ${asset}: ${tar.stderr}` + manualInstallHint(cacheDir, pattern),
-      };
-    }
+  const extracted = extractArchive(archivePath, cacheDir);
+  if (!extracted.ok) {
+    rmSync(tmp, { recursive: true, force: true });
+    return {
+      ok: false,
+      reason: "extract_failed",
+      hint: `Failed to extract ${asset}: ${extracted.error}` + manualInstallHint(cacheDir, pattern),
+    };
   }
 
   flattenLibrariesIntoCache(cacheDir);
